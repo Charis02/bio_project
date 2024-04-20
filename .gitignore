@@ -1,0 +1,5 @@
+data
+downloads
+checkpoints
+__pycache__
+*.log*
