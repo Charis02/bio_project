@@ -1,5 +1,6 @@
 data
 downloads
 checkpoints
+plots
 __pycache__
 *.log*
