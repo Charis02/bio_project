@@ -17,7 +17,7 @@ class MoELoraModel(nn.Module):
     self.routing_network = nn.Sequential(
         nn.Linear(embedding_dim, num_experts),
     )
-    self.num_experts_topk = 2
+    self.num_experts_topk = 1
 
     self.batch_norm_layer = nn.BatchNorm1d(embedding_dim)
 
@@ -55,7 +55,8 @@ class MoELoraModel(nn.Module):
 
         prediction[batch_idx] += w * hidden_states
 
-    prediction = self.batch_norm_layer(prediction)
+    if prediction.shape[0] > 1:
+      prediction = self.batch_norm_layer(prediction)
     
     return prediction
 
@@ -103,8 +104,11 @@ class RoutingNetworkFromTransformer(nn.Module):
 
 def get_embeddings(tokenizer, model, input,device):
     # Encode the SMILES sequence
-    encoded_input = tokenizer(input, return_tensors="pt", padding=True).to(device)   
-    original_embedding = model.original_embedding(**encoded_input)
+    # print(len(input[0]))
+    # print(len(input[1]))
+    encoded_input = tokenizer(input, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(device)   
+    with torch.no_grad():
+      original_embedding = model.original_embedding(**encoded_input)
     embeddings = model(original_embedding,**encoded_input)
 
     return embeddings
@@ -119,7 +123,8 @@ class DavisDataset(Dataset):
         self.target = self.data['Target']
         self.affinity = self.data['Y']
 
-        self.normalize_data()
+        # self.normalize_data()
+        # self.logarithm_data()
 
     def __len__(self):
         return len(self.affinity)
@@ -132,9 +137,13 @@ class DavisDataset(Dataset):
         }
 
     def normalize_data(self):
-      self.affinity_mean = self.affinity.mean()
-      self.affinity_std = self.affinity.std()
-      self.affinity = (self.affinity - self.affinity_mean) / self.affinity_std
+      pass
+      # self.affinity_mean = self.affinity.mean()
+      # self.affinity_std = self.affinity.std()
+      # self.affinity = (self.affinity - self.affinity_mean) / self.affinity_std
+    
+    def logarithm_data(self):
+      self.affinity = torch.log(self.affinity)
     
 class MoERegressor(nn.Module):
   """
@@ -176,24 +185,3 @@ class MoERegressor(nn.Module):
 
   
      return prediction
-  
-     
-class MoLoRaWrapper(nn.Module):
-  def __init__(self, original_layer, molora_config=None):
-      super().__init__()
-      self.original_layer = original_layer
-      router_weights = routing.RouterWeights(dtype='float32')
-      router = routing.Router(router_weights,jitter_noise=0.0,dtype='float32')
-
-      key = random.PRNGKey(0)
-      batch_size = 2
-      seq_length = 10
-      input_dim = 768
-      x_dummy = random.normal(key, (batch_size, seq_length, input_dim))
-
-      self.molora_layer = molora.MoLoRa(router)
-      
-      self.molora_params = self.molora_layer.init(key, x_dummy)
-
-  def forward(self, x):
-      return self.original_layer(x) + self.molora_layer(self.molora_params,x)
