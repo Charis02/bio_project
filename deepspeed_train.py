@@ -18,7 +18,6 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import pearsonr
 from tdc.utils import convert_back_log
-from galore_torch import GaLoreAdamW, GaLoreAdamW8bit, GaLoreAdafactor
 import torch.distributed as dist
 
 import deepspeed
@@ -159,14 +158,14 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # Load models
-    drug_model_dir = "/home/gridsan/cgeorgiou/bio/downloads/pretrained_models/ChemBERTaLM/models--gokceuludogan--ChemBERTaLM/snapshots/33199b39d6f4844644d436da9ae9399dcb7b505f"
+    drug_model_dir = "downloads/pretrained_models/ChemBERTaLM/models--gokceuludogan--ChemBERTaLM/snapshots/33199b39d6f4844644d436da9ae9399dcb7b505f"
     drug_tokenizer = RobertaTokenizer.from_pretrained(drug_model_dir)
     pretrained_drug_model = RobertaModel.from_pretrained(drug_model_dir, output_hidden_states=True)
 
     print(f"Dowloaded drug model",flush=True)
 
-    esm650 = "/home/gridsan/cgeorgiou/bio/downloads/pretrained_models/esm2_t33_650M_UR50D/models--facebook--esm2_t33_650M_UR50D/snapshots/08e4846e537177426273712802403f7ba8261b6c"
-    esm150 = "/home/gridsan/cgeorgiou/bio/downloads/pretrained_models/esm2_t30_150M_UR50D/models--facebook--esm2_t30_150M_UR50D/snapshots/a695f6045e2e32885fa60af20c13cb35398ce30c"
+    esm650 = "downloads/pretrained_models/esm2_t33_650M_UR50D/models--facebook--esm2_t33_650M_UR50D/snapshots/08e4846e537177426273712802403f7ba8261b6c"
+    esm150 = "downloads/pretrained_models/esm2_t30_150M_UR50D/models--facebook--esm2_t30_150M_UR50D/snapshots/a695f6045e2e32885fa60af20c13cb35398ce30c"
 
     target_model_dir = esm150
     config = AutoConfig.from_pretrained(target_model_dir, output_hidden_states=True)
