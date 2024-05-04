@@ -1,5 +1,5 @@
 
-from model_definitions import MoELoraModel, RoutingNetworkFromTransformer, get_embeddings, DavisDataset, MoERegressor
+from model_definitions import MoELoraModel, RoutingNetworkFromTransformer, get_embeddings, DTIDataset, MoERegressor
 
 from transformers import AutoConfig,AutoModelForSequenceClassification, AutoModel, AutoTokenizer
 from torch.cuda.amp import GradScaler, autocast
@@ -18,49 +18,35 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import pearsonr
 from tdc.utils import convert_back_log
+from galore_torch import GaLoreAdamW, GaLoreAdamW8bit, GaLoreAdafactor
+import torch.distributed as dist
 
 import deepspeed
 
-class BigModel(nn.Module):
-    def __init__(self, drug_model, target_model, regressor):
-        super().__init__()
-        self.drug_model = drug_model
-        self.target_model = target_model
-        self.regressor = regressor
-
-    def forward(self, drug_input, target_input):
-        with torch.no_grad():
-                original_drug_embedding = self.drug_model.original_embedding(**drug_input)
-        drug_embeddings = self.drug_model(original_drug_embedding,**drug_input)
-        
-        with torch.no_grad():
-            original_target_embedding = self.target_model.original_embedding(**target_input)
-        target_embeddings = self.target_model(original_target_embedding,**target_input)
-
-        all_embeds = torch.cat((drug_embeddings, target_embeddings), dim=1)
-        return self.regressor(all_embeds)
+def inverse_log(x):
+    return (10**(9-x) - 0.1)
 
 def train(
     model,
     drug_tokenizer,
     target_tokenizer,
-    optimizer,
-    optim_scheduler,
     train_data_loader,
     val_data_loader,
     loss_fn,
     device,
     num_epochs,
-    accumulation_steps=4,
     report_interval=100,
 ):
-    scaler = GradScaler()
-    print("Starting training", flush=True)
-    losses_arr = []
+    rank = dist.get_rank()
+    print(f"Starting training for rank {rank}", flush=True)
 
     for epoch in range(num_epochs):
         total_loss = 0
-        optimizer.zero_grad()  # Initialize gradient accumulation
+        predictions = []
+        targets = []
+
+        if epoch == 0:
+            model.save_checkpoint(f"checkpoints/bigModel",tag=epoch)
 
         for i, input in enumerate(train_data_loader):
             #with profiler.profile(profile_memory=True, use_cuda=True) as prof:
@@ -72,18 +58,31 @@ def train(
             target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)
 
             predicted_affinity = model(drug_input, target_input)
+
+            predictions.append(inverse_log(predicted_affinity.double().detach().cpu().numpy()))
+            targets.append(inverse_log(target_affinity.double().detach().cpu().numpy()))
             # print(f"Predicted affinity: {predicted_affinity}", flush=True)
             # print(f"Target affinity: {target_affinity}", flush=True)
-            loss = loss_fn(predicted_affinity, target_affinity)
-            total_loss += loss.detach().item()  # Adjust loss reporting
+            with torch.cuda.amp.autocast(cache_enabled=False):
+                loss = loss_fn(predicted_affinity, target_affinity)
+                total_loss += loss.detach().item()  # Adjust loss reporting
 
-            losses_arr.append(loss.detach().cpu().numpy())
-            model.backward(loss)  # Scale loss for gradient accumulation
+                # losses_arr.append(loss.detach().cpu().numpy())
+                
+                model.backward(loss)  # Scale loss for gradient accumulation
             model.step()  # Update weights
 
-            if i % report_interval == 0:
+            # only do this if you are rank 0
+            if i % report_interval == 0 and rank==0:
                 print(f"Loss at step {i}: {loss.item()}", flush=True)
-
+                np_predictions = np.concatenate(predictions).squeeze()
+                np_targets = np.concatenate(targets)
+                if i > 0 and i % (report_interval * 10) == 0:
+                    pcc, _ = pearsonr(np_predictions, np_targets)
+                    print(f"Pearson correlation coefficient: {pcc}", flush=True)
+                predictions = []
+                targets = []
+                
             del predicted_affinity, loss, target_affinity
             torch.cuda.empty_cache() 
 
@@ -91,23 +90,24 @@ def train(
         total_loss = total_loss / len(train_data_loader)
         print(f"Average loss: {total_loss}", flush=True)
 
+        # save model checkpoint
+        model.save_checkpoint(f"checkpoints/bigModel",tag=epoch)
+
         # plot loss vs iterations with gaussian smoothing in red
-        plt.clf()
-        plt.plot(range(len(losses_arr)),gaussian_filter1d(losses_arr, sigma=2), label="Train Loss vs Iterations", color='red')
-        plt.xlabel("Iterations")
-        plt.ylabel("Training Loss")
+        # plt.clf()
+        # plt.plot(range(len(losses_arr)),gaussian_filter1d(losses_arr, sigma=2), label="Train Loss vs Iterations", color='red')
+        # plt.xlabel("Iterations")
+        # plt.ylabel("Training Loss")
 
-        # drop top and right axis
-        ax = plt.gca()
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
+        # # drop top and right axis
+        # ax = plt.gca()
+        # ax.spines['top'].set_visible(False)
+        # ax.spines['right'].set_visible(False)
 
-        plt.savefig(f"plots/loss_plot_{epoch}.png")
+        # plt.savefig(f"plots/loss_plot_{epoch}.png")
 
         # save loss array
-        np.save(f"checkpoints/losses.npy", losses_arr)
-        optim_scheduler.step()
-
+        # np.save(f"checkpoints/losses.npy", losses_arr)
         # calculate pearson correlation on validation set
         model.eval()
         
@@ -121,16 +121,18 @@ def train(
                 target_seq = input['target']
                 target_affinity = torch.tensor(input['affinity'], dtype=torch.float).to(device)
 
-                drug_input = drug_tokenizer(drug_smiles, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(device)   
-                target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(device)
+                drug_input = drug_tokenizer(drug_smiles, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)   
+                target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)
 
                 predicted_affinity = model(drug_input, target_input)
 
-                loss = loss_fn(predicted_affinity, target_affinity)
-                val_loss += loss.detach().item() / accumulation_steps  # Adjust loss reporting
-                
-                predictions.append(convert_back_log(predicted_affinity.cpu().numpy()))
-                targets.append(convert_back_log(target_affinity.cpu().numpy()))
+                predictions.append(inverse_log(predicted_affinity.double().detach().cpu().numpy()))
+                targets.append(inverse_log(target_affinity.double().detach().cpu().numpy()))
+                # print(f"Predicted affinity: {predicted_affinity}", flush=True)
+                # print(f"Target affinity: {target_affinity}", flush=True)
+                with torch.cuda.amp.autocast(cache_enabled=False):
+                    loss = loss_fn(predicted_affinity, target_affinity)
+                    val_loss += loss.detach().item()  # Adjust loss reporting
 
             val_loss = val_loss / len(val_data_loader)
             print(f"Validation loss: {val_loss}", flush=True)
@@ -139,35 +141,20 @@ def train(
             predictions = np.concatenate(predictions).squeeze()
             targets = np.concatenate(targets)
             pcc, _ = pearsonr(predictions, targets)
-            print(f"Pearson correlation coefficient: {pcc}", flush=True)
+            print(f"Validation Pearson correlation coefficient: {pcc}", flush=True)
 
         model.train()
 
-
-# def get_dist_env():
-#     if 'OMPI_COMM_WORLD_SIZE' in os.environ:
-#         world_size = int(os.getenv('OMPI_COMM_WORLD_SIZE'))
-#     else:
-#         world_size = int(os.getenv('SLURM_NTASKS'))
-
-#     if 'OMPI_COMM_WORLD_RANK' in os.environ:
-#         global_rank = int(os.getenv('OMPI_COMM_WORLD_RANK'))
-#     else:
-#         global_rank = int(os.getenv('SLURM_PROCID'))
-#     return global_rank, world_size
-
 if __name__ == "__main__":
-    deepspeed.init_distributed(dist_backend="nccl",auto_mpi_discovery=False,verbose=True)
-
-    data = DTI(name = 'DAVIS',path='downloads/datasets/')
+    data = DTI(name = 'BindingDB_patent',path='downloads/datasets/')
     data.convert_to_log(form='binding')
     split = data.get_split()
 
-    train_dataset = DavisDataset(split, 'train')
-    val_dataset = DavisDataset(split, 'valid')
+    train_dataset = DTIDataset(split, 'train')
+    val_dataset = DTIDataset(split, 'valid')
 
-    train_data_loader = DataLoader(train_dataset, batch_size=2, num_workers=4, prefetch_factor=2, shuffle=True)
-    val_data_loader = DataLoader(val_dataset, batch_size=2, num_workers=4, prefetch_factor=2,  shuffle=True)
+    # train_data_loader = DataLoader(train_dataset, batch_size=32, num_workers=4, prefetch_factor=2, shuffle=True)
+    val_data_loader = DataLoader(val_dataset, batch_size=4, num_workers=4, prefetch_factor=2,  shuffle=True)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -205,7 +192,7 @@ if __name__ == "__main__":
     drug_moe_model = MoELoraModel(pretrained_drug_model, peft_config, num_experts, embedding_dim=768)
     target_moe_model = MoELoraModel(pretrained_target_model, peft_config, num_experts, embedding_dim=640)
 
-    regressor = nn.Sequential(nn.Linear(1408,512),nn.ReLU(),nn.Dropout(0.3), nn.Linear(512,128),nn.ReLU(),nn.Linear(128,1))
+    regressor = nn.Sequential(nn.Linear(1408,512),nn.ReLU(),nn.Dropout(0.12), nn.Linear(512,128),nn.ReLU(),nn.Linear(128,1))
 
     model = BigModel(drug_moe_model, target_moe_model, regressor)
 
@@ -213,14 +200,15 @@ if __name__ == "__main__":
     model.target_model.expert_model.set_adapter([f"expert_{i}" for i in range(num_experts)])  # we need to do this to pass all params to the optimizer
 
     params_to_train = list(model.parameters())
-    grad_accum_steps = 16
 
-    ds_model, optimizer, _, _ = deepspeed.initialize(config="deepspeed_config.json",
+    deepspeed.init_distributed(dist_backend="nccl",auto_mpi_discovery=False,verbose=True)
+    
+    ds_model, optimizer, train_data_loader, _ = deepspeed.initialize(config="deepspeed_config.json",
                                                         model=model,
-                                                        model_parameters=params_to_train)
-
+                                                        # optimizer=optimizer,
+                                                        model_parameters=params_to_train,
+                                                        training_data=train_dataset,)
     # optimizer = torch.optim.AdamW(params_to_train, lr=3e-4)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 12, eta_min=1e-6)
 
     # print available devices
     print("Available devices:")
@@ -238,13 +226,10 @@ if __name__ == "__main__":
         ds_model,
         drug_tokenizer,
         target_tokenizer,
-        optimizer,
-        None,
         train_data_loader,
         val_data_loader,
         loss,
         device,
         20,
-        accumulation_steps=grad_accum_steps,
-        report_interval=100
+        report_interval=500
     )

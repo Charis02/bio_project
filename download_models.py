@@ -15,10 +15,10 @@ save_directory = "./pretrained_models/ChemBERTaLM/"
 # model = RobertaModel.from_pretrained(model_name, cache_dir=save_directory)
 
 # Model identifier
-model_name = "facebook/esm2_t33_650M_UR50D"
+model_name = "facebook/esm2_t30_150M_UR50D"
 
 # Specify the directory where you want to save the model and tokenizer
-save_directory = "./pretrained_models/esm2_t33_650M_UR50D"
+save_directory = "./downloads/pretrained_models/esm2_t30_150M_UR50D"
 
 # Download and save the configuration with output_hidden_states set to True
 config = AutoConfig.from_pretrained(model_name, output_hidden_states=True, cache_dir=save_directory)
