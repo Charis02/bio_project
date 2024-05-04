@@ -1,0 +1,41 @@
+{
+    "optimizer": {
+      "type": "AdamW",
+      "params": {
+        "lr": 0.0003
+      }
+    },
+    "scheduler": {
+      "type": "WarmupDecayLR",
+      "params": {
+        "warmup_max_lr": 0.0003,
+        "total_num_steps": 100000,
+      }
+    },
+    "fp16": {
+      "enabled": true,
+      "auto_cast": true,
+      "loss_scale": 0,
+      "initial_scale_power": 16,
+      "loss_scale_window": 1000,
+      "hysteresis": 2,
+      "consecutive_hysteresis": false,
+      "min_loss_scale": 1
+  },
+    "zero_optimization": true,
+    // {
+    //     "stage": 2,
+    //     "offload_optimizer": {
+    //         "device": "cpu"
+    //     },
+    //     "contiguous_gradients": true,
+    //     "overlap_comm": true,
+    //     "reduce_scatter": true,
+    //     "reduce_bucket_size": 5e8,
+    //     "allgather_bucket_size": 5e8
+    // },
+
+    "gradient_accumulation_steps": 16,
+    "train_batch_size": 64,
+    "train_micro_batch_size_per_gpu": 2,
+}
