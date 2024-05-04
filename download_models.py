@@ -6,7 +6,7 @@ from transformers import AutoConfig, AutoTokenizer, AutoModelForSequenceClassifi
 model_name = "gokceuludogan/ChemBERTaLM"
 
 # Specify the directory where you want to save the model and tokenizer
-save_directory = "./pretrained_models/ChemBERTaLM/"
+save_directory = "./downloads/pretrained_models/ChemBERTaLM/"
 
 # Download and save the tokenizer
 # tokenizer = RobertaTokenizer.from_pretrained(model_name, cache_dir=save_directory)
