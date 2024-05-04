@@ -36,7 +36,6 @@ cmeel-urdfdom==3.1.0.3
 colorama==0.4.4
 colorlog==6.8.2
 comet-ml==3.37.1
-conda==23.3.1
 ConfigArgParse==1.7
 configobj==5.0.8
 cvxpy==1.4.1
@@ -197,7 +196,6 @@ pyqt5-tools==5.15.9.3.3
 pyquaternion==0.9.9
 pysdf==0.1.9
 # Editable install with no version control (PyTDC==0.4.6)
--e /home/gridsan/cgeorgiou/.local/lib/python3.9/site-packages
 python-box==6.1.0
 python-dotenv==1.0.0
 python-engineio==4.9.0
