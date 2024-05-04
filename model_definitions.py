@@ -17,9 +17,9 @@ class MoELoraModel(nn.Module):
     self.routing_network = nn.Sequential(
         nn.Linear(embedding_dim, num_experts),
     )
-    self.num_experts_topk = 1
+    self.num_experts_topk = 2
 
-    self.batch_norm_layer = nn.BatchNorm1d(embedding_dim)
+    # self.batch_norm_layer = nn.BatchNorm1d(embedding_dim)
 
   def forward(self, router_inputs, **inputs):
     logits = self.routing_network(router_inputs)  # logits should be shape (num_experts, )
@@ -40,7 +40,6 @@ class MoELoraModel(nn.Module):
         # get the embeddings
         expert_embed = self.expert_model(**routed_inputs)
 
-
         # Extract the hidden states
         if hasattr(expert_embed, "last_hidden_state"): # Depends on the pretrained model backbone
           hidden_states = expert_embed.last_hidden_state
@@ -55,13 +54,12 @@ class MoELoraModel(nn.Module):
 
         prediction[batch_idx] += w * hidden_states
 
-    if prediction.shape[0] > 1:
-      prediction = self.batch_norm_layer(prediction)
+    # if prediction.shape[0] > 1:
+    #   prediction = self.batch_norm_layer(prediction)
     
     return prediction
 
   def original_embedding(self, **inputs):
-    # self.expert_model.disable_adapter_layers()
     self.expert_model.set_adapter([])
     original_outputs = self.expert_model(**inputs)
     
@@ -113,15 +111,15 @@ def get_embeddings(tokenizer, model, input,device):
 
     return embeddings
 
-class DavisDataset(Dataset):
-    def __init__(self, data, split='train'):
+class DTIDataset(Dataset):
+    def __init__(self, data, split='train',drug_label='Drug',target_label='Target',affinity_label='Y'):
         # Assuming data is a dictionary with 'train', 'valid', 'test' splits
         # Concatenate training, validation, and test sets if needed
         # Or you can adjust the code to use only one of the splits
         self.data = data[split]
-        self.drug = self.data['Drug']
-        self.target = self.data['Target']
-        self.affinity = self.data['Y']
+        self.drug = self.data[drug_label]
+        self.target = self.data[target_label]
+        self.affinity = self.data[affinity_label]
 
         # self.normalize_data()
         # self.logarithm_data()
@@ -185,3 +183,35 @@ class MoERegressor(nn.Module):
 
   
      return prediction
+  
+
+class BigModel(nn.Module):
+    def __init__(self, drug_model, target_model, regressor):
+        super().__init__()
+        self.drug_model = drug_model
+        self.target_model = target_model
+        self.regressor = regressor
+        # self.drug_to_common = nn.Linear(768, 128)
+        # self.target_to_common = nn.Linear(640, 128)
+        # self.cross_attention_drug = nn.MultiheadAttention(768, 8,dtype=torch.float16)
+        # self.cross_attention_target = nn.MultiheadAttention(768, 8,dtype=torch.float16)
+
+
+    def forward(self, drug_input, target_input):
+        with torch.no_grad():
+            original_drug_embedding = self.drug_model.original_embedding(**drug_input)
+            original_target_embedding = self.target_model.original_embedding(**target_input)
+
+        drug_embeddings = self.drug_model(original_drug_embedding,**drug_input).half()
+        target_embeddings = self.target_model(original_target_embedding,**target_input).half()
+
+        all_embeds = torch.cat([drug_embeddings, target_embeddings], dim=1)
+        # drug_embeddings = self.drug_to_common(drug_embeddings)
+        # target_embeddings = self.target_to_common(target_embeddings)
+
+        # cross_attended_drug, _ = self.cross_attention_drug(drug_embeddings, target_embeddings, target_embeddings)
+        # cross_attended_target, _ = self.cross_attention_target(target_embeddings, drug_embeddings, drug_embeddings)
+        
+        # all_embeds = torch.cat([drug_embeddings, target_embeddings, cross_attended_drug, cross_attended_target], dim=1).half()
+        
+        return self.regressor(all_embeds)
