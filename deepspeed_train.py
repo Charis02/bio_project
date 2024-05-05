@@ -39,6 +39,8 @@ def train(
     rank = dist.get_rank()
     print(f"Starting training for rank {rank}", flush=True)
 
+    losses_arr = []
+
     for epoch in range(num_epochs):
         total_loss = 0
         predictions = []
@@ -65,8 +67,9 @@ def train(
             with torch.cuda.amp.autocast(cache_enabled=False):
                 loss = loss_fn(predicted_affinity, target_affinity)
                 total_loss += loss.detach().item()  # Adjust loss reporting
-
-                # losses_arr.append(loss.detach().cpu().numpy())
+                
+                if rank == 0:
+                    losses_arr.append(loss.detach().cpu().numpy())
                 
                 model.backward(loss)  # Scale loss for gradient accumulation
             model.step()  # Update weights
@@ -85,28 +88,28 @@ def train(
             del predicted_affinity, loss, target_affinity
             torch.cuda.empty_cache() 
 
-        print(f"Epoch {epoch} completed", flush=True)
-        total_loss = total_loss / len(train_data_loader)
-        print(f"Average loss: {total_loss}", flush=True)
-
-        # save model checkpoint
-        model.save_checkpoint(f"checkpoints/bigModel",tag=epoch)
 
         # plot loss vs iterations with gaussian smoothing in red
-        # plt.clf()
-        # plt.plot(range(len(losses_arr)),gaussian_filter1d(losses_arr, sigma=2), label="Train Loss vs Iterations", color='red')
-        # plt.xlabel("Iterations")
-        # plt.ylabel("Training Loss")
+        if rank == 0:
+            print(f"Epoch {epoch} completed", flush=True)
+            total_loss = total_loss / len(train_data_loader)
+            print(f"Average loss: {total_loss}", flush=True)
+            plt.clf()
+            plt.plot(range(len(losses_arr)),gaussian_filter1d(losses_arr, sigma=2), label="Training Loss vs Iterations", color='blue')
+            plt.xlabel("Iterations")
+            plt.ylabel("Training Loss")
 
-        # # drop top and right axis
-        # ax = plt.gca()
-        # ax.spines['top'].set_visible(False)
-        # ax.spines['right'].set_visible(False)
+            # drop top and right axis
+            ax = plt.gca()
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
 
-        # plt.savefig(f"plots/loss_plot_{epoch}.png")
+            plt.savefig(f"plots/loss_plot_{epoch}.png")
+            plt.close()
+            np.save(f"checkpoints/losses.npy", losses_arr)
 
-        # save loss array
-        # np.save(f"checkpoints/losses.npy", losses_arr)
+            # save model checkpoint
+            model.save_checkpoint(f"checkpoints/bigModel",tag=epoch)
         # calculate pearson correlation on validation set
         model.eval()
         
