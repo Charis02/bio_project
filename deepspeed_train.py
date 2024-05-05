@@ -40,6 +40,9 @@ def train(
     print(f"Starting training for rank {rank}", flush=True)
 
     losses_arr = []
+    val_losses = []
+    val_pcc = []
+    pcc_arr = []
 
     for epoch in range(num_epochs):
         total_loss = 0
@@ -82,6 +85,8 @@ def train(
                 if i > 0 and i % (report_interval * 10) == 0:
                     pcc, _ = pearsonr(np_predictions, np_targets)
                     print(f"Pearson correlation coefficient: {pcc}", flush=True)
+                    pcc_arr.append(pcc)
+
                 predictions = []
                 targets = []
                 
@@ -94,58 +99,64 @@ def train(
             print(f"Epoch {epoch} completed", flush=True)
             total_loss = total_loss / len(train_data_loader)
             print(f"Average loss: {total_loss}", flush=True)
-            plt.clf()
-            plt.plot(range(len(losses_arr)),gaussian_filter1d(losses_arr, sigma=2), label="Training Loss vs Iterations", color='blue')
-            plt.xlabel("Iterations")
-            plt.ylabel("Training Loss")
+            # plt.clf()
+            # plt.plot(range(len(losses_arr)),gaussian_filter1d(losses_arr, sigma=2), label="Training Loss vs Iterations", color='blue')
+            # plt.xlabel("Iterations")
+            # plt.ylabel("Training Loss")
 
-            # drop top and right axis
-            ax = plt.gca()
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
+            # # drop top and right axis
+            # ax = plt.gca()
+            # ax.spines['top'].set_visible(False)
+            # ax.spines['right'].set_visible(False)
 
-            plt.savefig(f"plots/loss_plot_{epoch}.png")
-            plt.close()
+            # plt.savefig(f"plots/loss_plot_{epoch}.png")
+            # plt.close()
             np.save(f"checkpoints/losses.npy", losses_arr)
+            np.save(f"checkpoints/pcc.npy", pcc_arr)
 
             # save model checkpoint
             model.save_checkpoint(f"checkpoints/bigModel",tag=epoch)
-        # calculate pearson correlation on validation set
-        model.eval()
-        
-        val_loss = 0
-        predictions = []
-        targets = []
+            # calculate pearson correlation on validation set
+            model.eval()
+            
+            val_loss = 0
+            predictions = []
+            targets = []
 
-        with torch.no_grad():
-            for i, input in enumerate(val_data_loader):
-                drug_smiles = input['drug']
-                target_seq = input['target']
-                target_affinity = torch.tensor(input['affinity'], dtype=torch.float).to(device)
+            with torch.no_grad():
+                for i, input in enumerate(val_data_loader):
+                    drug_smiles = input['drug']
+                    target_seq = input['target']
+                    target_affinity = torch.tensor(input['affinity'], dtype=torch.float).to(device)
 
-                drug_input = drug_tokenizer(drug_smiles, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)   
-                target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)
+                    drug_input = drug_tokenizer(drug_smiles, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)   
+                    target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)
 
-                predicted_affinity = model(drug_input, target_input)
+                    predicted_affinity = model(drug_input, target_input)
 
-                predictions.append(inverse_log(predicted_affinity.double().detach().cpu().numpy()))
-                targets.append(inverse_log(target_affinity.double().detach().cpu().numpy()))
-                # print(f"Predicted affinity: {predicted_affinity}", flush=True)
-                # print(f"Target affinity: {target_affinity}", flush=True)
-                with torch.cuda.amp.autocast(cache_enabled=False):
-                    loss = loss_fn(predicted_affinity, target_affinity)
-                    val_loss += loss.detach().item()  # Adjust loss reporting
+                    predictions.append(inverse_log(predicted_affinity.double().detach().cpu().numpy()))
+                    targets.append(inverse_log(target_affinity.double().detach().cpu().numpy()))
+                    # print(f"Predicted affinity: {predicted_affinity}", flush=True)
+                    # print(f"Target affinity: {target_affinity}", flush=True)
+                    with torch.cuda.amp.autocast(cache_enabled=False):
+                        loss = loss_fn(predicted_affinity, target_affinity)
+                        val_loss += loss.detach().item()  # Adjust loss reporting
 
-            val_loss = val_loss / len(val_data_loader)
-            print(f"Validation loss: {val_loss}", flush=True)
+                val_loss = val_loss / len(val_data_loader)
+                print(f"Validation loss: {val_loss}", flush=True)
 
-            # Calculate Pearson correlation coefficient
-            predictions = np.concatenate(predictions).squeeze()
-            targets = np.concatenate(targets)
-            pcc, _ = pearsonr(predictions, targets)
-            print(f"Validation Pearson correlation coefficient: {pcc}", flush=True)
+                # Calculate Pearson correlation coefficient
+                predictions = np.concatenate(predictions).squeeze()
+                targets = np.concatenate(targets)
+                pcc, _ = pearsonr(predictions, targets)
+                print(f"Validation Pearson correlation coefficient: {pcc}", flush=True)
+                val_pcc.append(pcc)
+                np.save(f"checkpoints/val_pcc.npy", val_pcc)
 
-        model.train()
+                val_losses.append(val_loss)
+                np.save(f"checkpoints/val_losses.npy", val_losses)
+
+            model.train()
 
 if __name__ == "__main__":
     data = DTI(name = 'BindingDB_patent',path='downloads/datasets/')
