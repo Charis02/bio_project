@@ -21,9 +21,26 @@ from tdc.utils import convert_back_log
 import torch.distributed as dist
 
 import deepspeed
+import mpi4py
+import sys
+import subprocess
 
 def inverse_log(x):
     return (10**(9-x) - 0.1)
+
+
+def gather_numpy_arrays(array, root=0):
+    # Convert numpy array to tensor
+    tensor = torch.from_numpy(array).float().cuda()
+    # Gather tensors on root process
+    gathered_tensors = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
+    dist.gather(tensor, gather_list=gathered_tensors if dist.get_rank() == root else None, dst=root)
+    if dist.get_rank() == root:
+        # Convert tensors back to numpy
+        gathered_arrays = [t.cpu().numpy() for t in gathered_tensors]
+        return np.concatenate(gathered_arrays)
+    else:
+        return None
 
 def train(
     model,
@@ -36,6 +53,7 @@ def train(
     num_epochs,
     report_interval=100,
 ):
+    root = 0
     rank = dist.get_rank()
     print(f"Starting training for rank {rank}", flush=True)
 
@@ -70,95 +88,108 @@ def train(
             with torch.cuda.amp.autocast(cache_enabled=False):
                 loss = loss_fn(predicted_affinity, target_affinity)
                 total_loss += loss.detach().item()  # Adjust loss reporting
-                
-                if rank == 0:
-                    losses_arr.append(loss.detach().cpu().numpy())
+                losses_arr.append(loss.detach().cpu().numpy())
                 
                 model.backward(loss)  # Scale loss for gradient accumulation
             model.step()  # Update weights
 
             # only do this if you are rank 0
-            if i % report_interval == 0 and rank==0:
-                print(f"Loss at step {i}: {loss.item()}", flush=True)
+            if i % report_interval == 0:
                 np_predictions = np.concatenate(predictions).squeeze()
                 np_targets = np.concatenate(targets)
-                if i > 0 and i % (report_interval * 10) == 0:
-                    pcc, _ = pearsonr(np_predictions, np_targets)
-                    print(f"Pearson correlation coefficient: {pcc}", flush=True)
-                    pcc_arr.append(pcc)
+                
+                gathered_targets = gather_numpy_arrays(np_targets, root=root)
+                gathered_predictions = gather_numpy_arrays(np_predictions, root=root)
+
+                if rank == root:
+                    # reduce loss and calculate average
+                    print(f"Sampled loss at step {i}: {loss.item()}", flush=True)
+
+                    if i > 0 and i % (report_interval * 10) == 0:
+                        pcc, _ = pearsonr(gathered_predictions, gathered_targets)
+                        print(f"Pearson correlation coefficient: {pcc}", flush=True)
+                        pcc_arr.append(pcc)
 
                 predictions = []
                 targets = []
-                
-            del predicted_affinity, loss, target_affinity
-            torch.cuda.empty_cache() 
 
 
+        total_loss = total_loss / len(train_data_loader)
+        gathered_loss = torch.tensor(total_loss).cuda()
+        dist.reduce(gathered_loss, root=root)
+        gathered_loss = gathered_loss.item()
+        gathered_loss = gathered_loss / dist.get_world_size()
         # plot loss vs iterations with gaussian smoothing in red
         if rank == 0:
             print(f"Epoch {epoch} completed", flush=True)
-            total_loss = total_loss / len(train_data_loader)
-            print(f"Average loss: {total_loss}", flush=True)
-            # plt.clf()
-            # plt.plot(range(len(losses_arr)),gaussian_filter1d(losses_arr, sigma=2), label="Training Loss vs Iterations", color='blue')
-            # plt.xlabel("Iterations")
-            # plt.ylabel("Training Loss")
-
-            # # drop top and right axis
-            # ax = plt.gca()
-            # ax.spines['top'].set_visible(False)
-            # ax.spines['right'].set_visible(False)
-
-            # plt.savefig(f"plots/loss_plot_{epoch}.png")
-            # plt.close()
+            print(f"Average loss: {gathered_loss}", flush=True)
+            
             np.save(f"checkpoints/losses.npy", losses_arr)
             np.save(f"checkpoints/pcc.npy", pcc_arr)
 
             # save model checkpoint
             model.save_checkpoint(f"checkpoints/bigModel",tag=epoch)
             # calculate pearson correlation on validation set
-            model.eval()
-            
-            val_loss = 0
-            predictions = []
-            targets = []
 
-            with torch.no_grad():
-                for i, input in enumerate(val_data_loader):
-                    drug_smiles = input['drug']
-                    target_seq = input['target']
-                    target_affinity = torch.tensor(input['affinity'], dtype=torch.float).to(device)
+        total_loss = 0
 
-                    drug_input = drug_tokenizer(drug_smiles, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)   
-                    target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)
+        model.eval()
+        
+        val_loss = 0
+        predictions = []
+        targets = []
 
-                    predicted_affinity = model(drug_input, target_input)
+        with torch.no_grad():
+            for i, input in enumerate(val_data_loader):
+                drug_smiles = input['drug']
+                target_seq = input['target']
+                target_affinity = torch.tensor(input['affinity'], dtype=torch.float).to(device)
 
-                    predictions.append(inverse_log(predicted_affinity.double().detach().cpu().numpy()))
-                    targets.append(inverse_log(target_affinity.double().detach().cpu().numpy()))
-                    # print(f"Predicted affinity: {predicted_affinity}", flush=True)
-                    # print(f"Target affinity: {target_affinity}", flush=True)
-                    with torch.cuda.amp.autocast(cache_enabled=False):
-                        loss = loss_fn(predicted_affinity, target_affinity)
-                        val_loss += loss.detach().item()  # Adjust loss reporting
+                drug_input = drug_tokenizer(drug_smiles, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)   
+                target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)
 
-                val_loss = val_loss / len(val_data_loader)
-                print(f"Validation loss: {val_loss}", flush=True)
+                predicted_affinity = model(drug_input, target_input)
 
-                # Calculate Pearson correlation coefficient
-                predictions = np.concatenate(predictions).squeeze()
-                targets = np.concatenate(targets)
-                pcc, _ = pearsonr(predictions, targets)
+                targets.append(inverse_log(target_affinity.double().detach().cpu().numpy()))
+                predictions.append(inverse_log(predicted_affinity.double().detach().cpu().numpy()))
+                # print(f"Predicted affinity: {predicted_affinity}", flush=True)
+                # print(f"Target affinity: {target_affinity}", flush=True)
+                with torch.cuda.amp.autocast(cache_enabled=False):
+                    loss = loss_fn(predicted_affinity, target_affinity)
+                    val_loss += loss.detach().item()  # Adjust loss reporting
+
+            val_loss = val_loss / len(val_data_loader)
+            print(f"Validation loss: {val_loss}", flush=True)
+            gathered_loss = torch.tensor(val_loss).cuda()
+            dist.reduce(gathered_loss, root=root)
+            gathered_loss = gathered_loss.item()
+            gathered_loss = gathered_loss / dist.get_world_size()
+
+            # Calculate Pearson correlation coefficient
+            predictions = np.concatenate(predictions).squeeze()
+            targets = np.concatenate(targets)
+
+            # COllect all predictions and targets
+            gathered_targets = gather_numpy_arrays(targets, root=root)
+            gathered_predictions = gather_numpy_arrays(predictions, root=root)
+
+            if rank == root:
+                pcc, _ = pearsonr(gathered_predictions, gathered_targets)
                 print(f"Validation Pearson correlation coefficient: {pcc}", flush=True)
                 val_pcc.append(pcc)
+
                 np.save(f"checkpoints/val_pcc.npy", val_pcc)
 
-                val_losses.append(val_loss)
+                val_losses.append(gathered_loss)
                 np.save(f"checkpoints/val_losses.npy", val_losses)
 
-            model.train()
+        model.train()
 
 if __name__ == "__main__":
+    # run the cmd "alias mpirun=my_mpirun_wrapper"
+    os.environ['PATH'] = "/home/gridsan/cgeorgiou/bio:" + os.environ['PATH']  
+    
+
     data = DTI(name = 'BindingDB_patent',path='downloads/datasets/')
     data.convert_to_log(form='binding')
     split = data.get_split()
@@ -214,7 +245,7 @@ if __name__ == "__main__":
 
     params_to_train = list(model.parameters())
 
-    deepspeed.init_distributed(dist_backend="nccl",auto_mpi_discovery=False,verbose=True)
+    deepspeed.init_distributed(dist_backend="nccl",auto_mpi_discovery=True,verbose=False)
     
     ds_model, optimizer, train_data_loader, _ = deepspeed.initialize(config="deepspeed_config.json",
                                                         model=model,
@@ -243,6 +274,6 @@ if __name__ == "__main__":
         val_data_loader,
         loss,
         device,
-        20,
+        100,
         report_interval=500
     )

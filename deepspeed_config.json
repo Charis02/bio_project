@@ -35,7 +35,7 @@
     //     "allgather_bucket_size": 5e8
     // },
 
-    "gradient_accumulation_steps": 16,
-    "train_batch_size": 64,
+    "gradient_accumulation_steps": 8,
+    "train_batch_size": 128,
     "train_micro_batch_size_per_gpu": 2,
 }
