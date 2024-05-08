@@ -42,12 +42,69 @@ def gather_numpy_arrays(array, root=0):
     else:
         return None
 
+def validate(model, val_data_loader,total_val_batches, loss_fn, device, root=0):
+    rank = torch.distributed.get_rank()
+    model.eval()
+    
+    val_loss = 0
+    predictions = []
+    targets = []
+
+    with torch.no_grad():
+        for i, input in enumerate(val_data_loader):
+            # only get 2 out of 16 batches in input, corresponding to your rank
+            if i % dist.get_world_size() != rank:
+                continue
+
+            drug_smiles = input['drug']
+            target_seq = input['target']
+            target_affinity = torch.tensor(input['affinity'], dtype=torch.float).to(device)
+
+            drug_input = drug_tokenizer(drug_smiles, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)   
+            target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)
+
+            predicted_affinity = model(drug_input, target_input)
+
+            targets.append(inverse_log(target_affinity.double().detach().cpu().numpy()))
+            predictions.append(inverse_log(predicted_affinity.double().detach().cpu().numpy()))
+            # print(f"Predicted affinity: {predicted_affinity}", flush=True)
+            # print(f"Target affinity: {target_affinity}", flush=True)
+            loss = loss_fn(predicted_affinity, target_affinity)
+            val_loss += loss.detach().item()  # Adjust loss reporting
+
+        gathered_loss = torch.tensor(val_loss).cuda()
+        dist.reduce(gathered_loss,root)
+        gathered_loss = gathered_loss.item()
+        gathered_loss = gathered_loss / total_val_batches
+
+        # Calculate Pearson correlation coefficient
+        predictions = np.concatenate(predictions).squeeze()
+        targets = np.concatenate(targets)
+
+        # COllect all predictions and targets
+        gathered_targets = gather_numpy_arrays(targets, root=root)
+        gathered_predictions = gather_numpy_arrays(predictions, root=root)
+
+        if rank == root:
+            print(f"Validation loss: {gathered_loss}", flush=True)
+            pcc, _ = pearsonr(gathered_predictions, gathered_targets)
+            print(f"Validation Pearson correlation coefficient: {pcc}", flush=True)
+            val_loss = gathered_loss
+        else:
+            pcc = None
+
+    model.train()
+
+    return val_loss, pcc
+
 def train(
     model,
     drug_tokenizer,
     target_tokenizer,
     train_data_loader,
     val_data_loader,
+    total_train_batches,
+    total_val_batches,
     loss_fn,
     device,
     num_epochs,
@@ -66,9 +123,6 @@ def train(
         total_loss = 0
         predictions = []
         targets = []
-
-        if epoch == 0:
-            model.save_checkpoint(f"checkpoints/bigModel",tag=epoch)
 
         for i, input in enumerate(train_data_loader):
             #with profiler.profile(profile_memory=True, use_cuda=True) as prof:
@@ -114,11 +168,11 @@ def train(
                 targets = []
 
 
-        total_loss = total_loss / len(train_data_loader)
+        total_loss = total_loss
         gathered_loss = torch.tensor(total_loss).cuda()
-        dist.reduce(gathered_loss, root=root)
+        dist.reduce(gathered_loss,root)
         gathered_loss = gathered_loss.item()
-        gathered_loss = gathered_loss / dist.get_world_size()
+        gathered_loss = gathered_loss / total_train_batches
         # plot loss vs iterations with gaussian smoothing in red
         if rank == 0:
             print(f"Epoch {epoch} completed", flush=True)
@@ -127,69 +181,26 @@ def train(
             np.save(f"checkpoints/losses.npy", losses_arr)
             np.save(f"checkpoints/pcc.npy", pcc_arr)
 
-            # save model checkpoint
-            model.save_checkpoint(f"checkpoints/bigModel",tag=epoch)
-            # calculate pearson correlation on validation set
+        # save model checkpoint
+        model.save_checkpoint(f"checkpoints/bigModel",tag=epoch)
+        # calculate pearson correlation on validation set
 
-        total_loss = 0
+        if rank == 0:
+            print(f"Starting validation for epoch {epoch}", flush=True)
 
-        model.eval()
-        
-        val_loss = 0
-        predictions = []
-        targets = []
+        val_loss, pcc = validate(model, val_data_loader, total_val_batches, loss_fn, device)
 
-        with torch.no_grad():
-            for i, input in enumerate(val_data_loader):
-                drug_smiles = input['drug']
-                target_seq = input['target']
-                target_affinity = torch.tensor(input['affinity'], dtype=torch.float).to(device)
-
-                drug_input = drug_tokenizer(drug_smiles, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)   
-                target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)
-
-                predicted_affinity = model(drug_input, target_input)
-
-                targets.append(inverse_log(target_affinity.double().detach().cpu().numpy()))
-                predictions.append(inverse_log(predicted_affinity.double().detach().cpu().numpy()))
-                # print(f"Predicted affinity: {predicted_affinity}", flush=True)
-                # print(f"Target affinity: {target_affinity}", flush=True)
-                with torch.cuda.amp.autocast(cache_enabled=False):
-                    loss = loss_fn(predicted_affinity, target_affinity)
-                    val_loss += loss.detach().item()  # Adjust loss reporting
-
-            val_loss = val_loss / len(val_data_loader)
-            print(f"Validation loss: {val_loss}", flush=True)
-            gathered_loss = torch.tensor(val_loss).cuda()
-            dist.reduce(gathered_loss, root=root)
-            gathered_loss = gathered_loss.item()
-            gathered_loss = gathered_loss / dist.get_world_size()
-
-            # Calculate Pearson correlation coefficient
-            predictions = np.concatenate(predictions).squeeze()
-            targets = np.concatenate(targets)
-
-            # COllect all predictions and targets
-            gathered_targets = gather_numpy_arrays(targets, root=root)
-            gathered_predictions = gather_numpy_arrays(predictions, root=root)
-
-            if rank == root:
-                pcc, _ = pearsonr(gathered_predictions, gathered_targets)
-                print(f"Validation Pearson correlation coefficient: {pcc}", flush=True)
-                val_pcc.append(pcc)
-
-                np.save(f"checkpoints/val_pcc.npy", val_pcc)
-
-                val_losses.append(gathered_loss)
-                np.save(f"checkpoints/val_losses.npy", val_losses)
-
-        model.train()
+        if rank == 0:
+            val_losses.append(val_loss)
+            val_pcc.append(pcc)
+            print(f"Finished validation for epoch {epoch}", flush=True)
+            np.save(f"checkpoints/val_losses.npy", val_losses)
+            np.save(f"checkpoints/val_pcc.npy", val_pcc)
 
 if __name__ == "__main__":
     # run the cmd "alias mpirun=my_mpirun_wrapper"
     os.environ['PATH'] = "/home/gridsan/cgeorgiou/bio:" + os.environ['PATH']  
     
-
     data = DTI(name = 'BindingDB_patent',path='downloads/datasets/')
     data.convert_to_log(form='binding')
     split = data.get_split()
@@ -197,8 +208,11 @@ if __name__ == "__main__":
     train_dataset = DTIDataset(split, 'train')
     val_dataset = DTIDataset(split, 'valid')
 
+    train_num_batches = (len(train_dataset)+1)//2
+    val_num_batches = (len(val_dataset)+1)//2
+
     # train_data_loader = DataLoader(train_dataset, batch_size=32, num_workers=4, prefetch_factor=2, shuffle=True)
-    val_data_loader = DataLoader(val_dataset, batch_size=4, num_workers=4, prefetch_factor=2,  shuffle=True)
+    val_data_loader = DataLoader(val_dataset, batch_size=2, num_workers=4, prefetch_factor=2,  shuffle=True)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -272,6 +286,8 @@ if __name__ == "__main__":
         target_tokenizer,
         train_data_loader,
         val_data_loader,
+        train_num_batches,
+        val_num_batches,
         loss,
         device,
         100,
