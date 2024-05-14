@@ -1,5 +1,5 @@
 
-from model_definitions import MoELoraModel, RoutingNetworkFromTransformer, get_embeddings, DTIDataset, MoERegressor, BigModel
+from model_definitions import MoELoraModel, DTIDataset, BigModel
 
 from transformers import AutoConfig,AutoModelForSequenceClassification, AutoModel, AutoTokenizer
 from torch.cuda.amp import GradScaler, autocast
@@ -41,6 +41,38 @@ def gather_numpy_arrays(array, root=0):
         return np.concatenate(gathered_arrays)
     else:
         return None
+    
+def gather_tensors(tensor, root=0):
+    # Gather tensors on root process
+    gathered_tensors = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
+    dist.gather(tensor, gather_list=gathered_tensors if dist.get_rank() == root else None, dst=root)
+    if dist.get_rank() == root:
+        result = torch.stack(gathered_tensors, dim=0)
+        return result
+    else:
+        return None
+
+def trace_backprop(tensor):
+    """
+    Prints the backpropagation graph of a tensor.
+    """
+    def _trace(tensor, depth=0):
+        if tensor is None:
+            print("  " * depth + "None")
+        elif hasattr(tensor, 'grad_fn'):
+            if tensor.grad_fn is not None:
+                print("  " * depth + str(tensor.grad_fn))
+                for next_tensor in tensor.grad_fn.next_functions:
+                    if next_tensor[0] is not None:
+                        _trace(next_tensor[0], depth + 1)
+                    else:
+                        print("  " * depth + 1 * " " + "None")
+            else:
+                print("  " * depth + "No grad_fn, could be a leaf tensor or a detached tensor")
+        else:
+            print("  " * depth + "Object does not have a grad_fn attribute")
+
+    _trace(tensor)
 
 def validate(model, val_data_loader,total_val_batches, loss_fn, device, root=0):
     rank = torch.distributed.get_rank()
@@ -63,7 +95,7 @@ def validate(model, val_data_loader,total_val_batches, loss_fn, device, root=0):
             drug_input = drug_tokenizer(drug_smiles, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)   
             target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)
 
-            predicted_affinity = model(drug_input, target_input)
+            predicted_affinity, drug_routing_probabilities, target_routing_probabilities, drug_expert_load, target_expert_load  = model(drug_input,target_input)
 
             targets.append(inverse_log(target_affinity.double().detach().cpu().numpy()))
             predictions.append(inverse_log(predicted_affinity.double().detach().cpu().numpy()))
@@ -110,6 +142,7 @@ def train(
     num_epochs,
     report_interval=100,
 ):
+    batch_size=2
     root = 0
     rank = dist.get_rank()
     print(f"Starting training for rank {rank}", flush=True)
@@ -133,7 +166,7 @@ def train(
             drug_input = drug_tokenizer(drug_smiles, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)   
             target_input = target_tokenizer(target_seq, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(model.device)
 
-            predicted_affinity = model(drug_input, target_input)
+            predicted_affinity, drug_routing_probabilities, target_routing_probabilities, drug_expert_load, target_expert_load  = model(drug_input,target_input)
 
             predictions.append(inverse_log(predicted_affinity.double().detach().cpu().numpy()))
             targets.append(inverse_log(target_affinity.double().detach().cpu().numpy()))
@@ -143,7 +176,22 @@ def train(
                 loss = loss_fn(predicted_affinity, target_affinity)
                 total_loss += loss.detach().item()  # Adjust loss reporting
                 losses_arr.append(loss.detach().cpu().numpy())
+
+                accumulated_drug_load_tensor = gather_tensors(drug_expert_load, root=root)
+                accumulated_target_load_tensor = gather_tensors(target_expert_load, root=root)
+
+                accumulated_drug_probabilities = gather_tensors(drug_routing_probabilities, root=root)
+                accumulated_target_probabilities = gather_tensors(target_routing_probabilities, root=root)
                 
+                # root adds load balancing loss
+                if rank == root:
+                    drug_Pi = accumulated_drug_probabilities.mean(dim=0).mean(dim=0)
+                    target_Pi = accumulated_target_probabilities.mean(dim=0).mean(dim=0)
+
+                    drug_fi = accumulated_drug_load_tensor.mean(dim=0)/(2*batch_size)    # 2 is for topk
+                    target_fi = accumulated_target_load_tensor.mean(dim=0)/(2*batch_size)
+
+                    loss += 0*(drug_fi*drug_Pi + target_fi*target_Pi).sum()
                 model.backward(loss)  # Scale loss for gradient accumulation
             model.step()  # Update weights
 
@@ -158,11 +206,16 @@ def train(
                 if rank == root:
                     # reduce loss and calculate average
                     print(f"Sampled loss at step {i}: {loss.item()}", flush=True)
+                    # print(f"Sampled drug experts load {drug_sum_across_experts}", flush=True)
+                    # print(f"Sampled target experts load {target_sum_across_experts}", flush=True)
 
                     if i > 0 and i % (report_interval * 10) == 0:
                         pcc, _ = pearsonr(gathered_predictions, gathered_targets)
                         print(f"Pearson correlation coefficient: {pcc}", flush=True)
                         pcc_arr.append(pcc)
+                    
+                    print(f"Drug capacity: {accumulated_drug_load_tensor}", flush=True)
+                    print(f"Target capacity: {accumulated_target_load_tensor}", flush=True)
 
                 predictions = []
                 targets = []
@@ -185,6 +238,8 @@ def train(
         model.save_checkpoint(f"checkpoints/bigModel",tag=epoch)
         # calculate pearson correlation on validation set
 
+        model.module.reduce_exploration()
+
         if rank == 0:
             print(f"Starting validation for epoch {epoch}", flush=True)
 
@@ -196,6 +251,8 @@ def train(
             print(f"Finished validation for epoch {epoch}", flush=True)
             np.save(f"checkpoints/val_losses.npy", val_losses)
             np.save(f"checkpoints/val_pcc.npy", val_pcc)
+
+        
 
 if __name__ == "__main__":
     # run the cmd "alias mpirun=my_mpirun_wrapper"
@@ -257,7 +314,17 @@ if __name__ == "__main__":
     model.drug_model.expert_model.set_adapter([f"expert_{i}" for i in range(num_experts)])  # we need to do this to pass all params to the optimizer
     model.target_model.expert_model.set_adapter([f"expert_{i}" for i in range(num_experts)])  # we need to do this to pass all params to the optimizer
 
+    big_model_dir = "checkpoints/bigModel/28/mp_rank_00_model_states.pt"
+    model.load_state_dict(torch.load(big_model_dir)['module'])
+
     params_to_train = list(model.parameters())
+
+    # freeze routing network
+    for param in model.drug_model.routing_network.parameters():
+        param.requires_grad = False
+    for param in model.target_model.routing_network.parameters():
+        param.requires_grad = False
+    
 
     deepspeed.init_distributed(dist_backend="nccl",auto_mpi_discovery=True,verbose=False)
     
@@ -266,19 +333,9 @@ if __name__ == "__main__":
                                                         # optimizer=optimizer,
                                                         model_parameters=params_to_train,
                                                         training_data=train_dataset,)
-    # optimizer = torch.optim.AdamW(params_to_train, lr=3e-4)
-
-    # print available devices
-    print("Available devices:")
-    print(torch.cuda.device_count())
-    print(torch.cuda.get_device_name(0))
-    print(device)
 
     # Run one ineference
     loss = nn.MSELoss()
-
-    allocated_memory = torch.cuda.memory_allocated(device)
-    print(f"Allocated Memory: {allocated_memory} bytes")
 
     train(
         ds_model,

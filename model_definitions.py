@@ -14,17 +14,33 @@ class MoELoraModel(nn.Module):
     for i in range(1,num_experts):
       self.expert_model.add_adapter(config,f"expert_{i}")
 
+    # self.routing_network = nn.Sequential(
+    #     nn.Linear(embedding_dim, 256),
+    #     nn.ReLU(),
+    #     nn.Linear(256, num_experts),
+    # )
+
     self.routing_network = nn.Sequential(
         nn.Linear(embedding_dim, num_experts),
     )
     self.num_experts_topk = 2
 
+    self.exploration_epsilon = 0
+
     # self.batch_norm_layer = nn.BatchNorm1d(embedding_dim)
 
   def forward(self, router_inputs, **inputs):
     logits = self.routing_network(router_inputs)  # logits should be shape (num_experts, )
-    weights, chosen_experts = torch.topk(logits, self.num_experts_topk)
-    weights = torch.softmax(weights, dim=1)
+    # with epsilon probability, choose a random expert if the model is in training mode
+    if False:#torch.rand(1) < self.exploration_epsilon and self.training:
+      chosen_experts = torch.randint(0, self.num_experts, (inputs["input_ids"].shape[0], self.num_experts_topk), device=next(self.parameters()).device)
+      exp_weights = torch.randn_like(chosen_experts, dtype=torch.float)
+    else:
+      exp_weights, chosen_experts = torch.topk(logits, self.num_experts_topk)
+    
+    weights = torch.softmax(exp_weights, dim=1)
+
+    expert_load = torch.zeros(self.num_experts, device=next(self.parameters()).device)
 
     # Create a prediction with the shape [batch, hidden_size]
     prediction = torch.zeros(inputs["input_ids"].shape[0],self.expert_model.config.hidden_size, device=next(self.parameters()).device)
@@ -32,6 +48,8 @@ class MoELoraModel(nn.Module):
     for current_expert in range(self.num_experts):
       batch_idx, nth_expert = torch.where(chosen_experts == current_expert)
       routed_inputs = {k: v[batch_idx] for k, v in inputs.items()}
+      ones = torch.ones_like(batch_idx, dtype=torch.float)
+      expert_load[current_expert] = ones.sum()
 
       if len(batch_idx) > 0:
         # enable only the expert adapter
@@ -56,8 +74,10 @@ class MoELoraModel(nn.Module):
 
     # if prediction.shape[0] > 1:
     #   prediction = self.batch_norm_layer(prediction)
-    
-    return prediction
+    return prediction, torch.softmax(logits,dim=1), expert_load
+
+  def reduce_exploration(self):
+    self.exploration_epsilon = max(0, self.exploration_epsilon - 0.1)
 
   def original_embedding(self, **inputs):
     self.expert_model.set_adapter([])
@@ -78,38 +98,6 @@ class MoELoraModel(nn.Module):
     self.routing_network.to(*args, **kwargs)
     self.expert_model.to(*args, **kwargs)
     return super().to(*args, **kwargs)
-
-class RoutingNetworkFromTransformer(nn.Module):
-  def __init__(self, model, num_experts, embedding_dim=384):
-    super().__init__()
-    self.num_experts = num_experts
-    self.last_layer = nn.Sequential(nn.Linear(embedding_dim, num_experts), nn.Softmax())
-    self.model = model
-
-  def forward(self, **inputs):
-    outputs = self.model(**inputs)
-
-    # Extract the hidden states
-    if hasattr(outputs, "last_hidden_state"): # Depends on the pretrained model backbone
-      hidden_states = outputs.last_hidden_state
-    else:
-      hidden_states = outputs.hidden_states[-1]
-
-    # Aggregate hidden states to get a single vector representation (e.g., mean pooling)
-    embeddings = torch.mean(hidden_states, dim=1)
-    return self.last_layer(embeddings)
-  
-
-def get_embeddings(tokenizer, model, input,device):
-    # Encode the SMILES sequence
-    # print(len(input[0]))
-    # print(len(input[1]))
-    encoded_input = tokenizer(input, return_tensors="pt", padding=True, truncation=True,max_length=1900).to(device)   
-    with torch.no_grad():
-      original_embedding = model.original_embedding(**encoded_input)
-    embeddings = model(original_embedding,**encoded_input)
-
-    return embeddings
 
 class DTIDataset(Dataset):
     def __init__(self, data, split='train',drug_label='Drug',target_label='Target',affinity_label='Y'):
@@ -142,48 +130,6 @@ class DTIDataset(Dataset):
     
     def logarithm_data(self):
       self.affinity = torch.log(self.affinity)
-    
-class MoERegressor(nn.Module):
-  """
-  Given an embedding, the MoERegressor predicts the affinity score.
-  Each expert is a feedforward neural network.
-  The router is a feedforward neural network that predicts the expert weights.
-  To find the routing weights, we use topk.
-  """
-  def __init__(self, num_experts, hidden_size, output_size):
-    super().__init__()
-    self.num_experts = num_experts
-    self.hidden_size = hidden_size
-    self.output_size = output_size
-    self.k = 2
-
-    self.experts = nn.ModuleList([nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU(), nn.Linear(hidden_size, output_size)) for _ in range(num_experts)])
-    self.router = nn.Linear(hidden_size, num_experts)
-
-  def forward(self, embeddings):
-     """
-     Find the top k experts for each batch and their weights
-     Send the sub-batch to each expert
-     """
-     routing_logits = self.router(embeddings)
-     expert_weights, expert_indices = torch.topk(routing_logits, self.k, dim=-1)
-
-     expert_weights = torch.softmax(expert_weights, dim=-1)
-  
-     # Create a prediction with the shape [batch, output dim]
-     prediction = torch.zeros(embeddings.shape[0], self.output_size, device=next(self.parameters()).device)
-  
-     for expert_idx in range(self.num_experts):
-      batch_indices = torch.where(expert_indices == expert_idx)
-      if len(batch_indices) > 0:
-        expert_input = embeddings[batch_indices[0]]
-        expert_output = self.experts[expert_idx](expert_input)
-        prediction_contribution = expert_weights[batch_indices].unsqueeze(-1)*expert_output
-        prediction[batch_indices[0]] += prediction_contribution
-
-  
-     return prediction
-  
 
 class BigModel(nn.Module):
     def __init__(self, drug_model, target_model, regressor):
@@ -191,10 +137,10 @@ class BigModel(nn.Module):
         self.drug_model = drug_model
         self.target_model = target_model
         self.regressor = regressor
-        # self.drug_to_common = nn.Linear(768, 128)
-        # self.target_to_common = nn.Linear(640, 128)
-        # self.cross_attention_drug = nn.MultiheadAttention(768, 8,dtype=torch.float16)
-        # self.cross_attention_target = nn.MultiheadAttention(768, 8,dtype=torch.float16)
+        # self.drug_to_common = nn.Linear(768, 640)
+        # self.target_to_common = nn.Linear(640, 640)
+        # self.cross_attention_drug = nn.MultiheadAttention(640, 8,dtype=torch.float16)
+        # self.cross_attention_target = nn.MultiheadAttention(640, 8,dtype=torch.float16)
 
 
     def forward(self, drug_input, target_input):
@@ -202,16 +148,20 @@ class BigModel(nn.Module):
             original_drug_embedding = self.drug_model.original_embedding(**drug_input)
             original_target_embedding = self.target_model.original_embedding(**target_input)
 
-        drug_embeddings = self.drug_model(original_drug_embedding,**drug_input).half()
-        target_embeddings = self.target_model(original_target_embedding,**target_input).half()
+        drug_embeddings, drug_routing_probabilities, drug_expert_load = self.drug_model(original_drug_embedding,**drug_input)
+        target_embeddings, target_routing_probabilities, target_expert_load = self.target_model(original_target_embedding,**target_input)
 
-        all_embeds = torch.cat([drug_embeddings, target_embeddings], dim=1)
+        all_embeds = torch.cat([drug_embeddings, target_embeddings], dim=1).half()
         # drug_embeddings = self.drug_to_common(drug_embeddings)
         # target_embeddings = self.target_to_common(target_embeddings)
 
         # cross_attended_drug, _ = self.cross_attention_drug(drug_embeddings, target_embeddings, target_embeddings)
         # cross_attended_target, _ = self.cross_attention_target(target_embeddings, drug_embeddings, drug_embeddings)
         
-        # all_embeds = torch.cat([drug_embeddings, target_embeddings, cross_attended_drug, cross_attended_target], dim=1).half()
+        # all_embeds = torch.cat([cross_attended_drug, cross_attended_target], dim=1).half()
         
-        return self.regressor(all_embeds)
+        return self.regressor(all_embeds), drug_routing_probabilities, target_routing_probabilities, drug_expert_load, target_expert_load
+
+    def reduce_exploration(self):
+      self.drug_model.reduce_exploration()
+      self.target_model.reduce_exploration()
