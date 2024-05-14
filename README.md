@@ -37,14 +37,12 @@ The methodology and experimental results demonstrate the model's ability to pred
 First, download the necessary data using the ```download_data.py``` script:
 
 ```
-sh
 python download_data.py
 ```
 
 Next, download the pre-trained models using the ```download_models.py``` script:
 
 ```
-sh
 python download_models.py
 ```
 
@@ -53,7 +51,6 @@ python download_models.py
 To train the model, use the ```deepspeed_train.py``` script:
 
 ```
-sh
 deepspeed deepspeed_train.py --deepspeed_config deepspeed_config.json
 ```
 
@@ -62,6 +59,5 @@ deepspeed deepspeed_train.py --deepspeed_config deepspeed_config.json
 After training, you can analyze the performance of the experts using the ```expert_analysis.py``` script:
 
 ```
-sh
 python expert_analysis.py
 ```
